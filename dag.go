@@ -1,204 +1,221 @@
 package merkledag
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 	"hash"
+	"math"
+)
+
+const (
+	Blob        = 256 * 1024
+	MaxBlobList = 1024
 )
 
 type Link struct {
-	Name string
-	Hash []byte
-	Size int
+	Hash string // 子节点的哈希值
+	Size int    // 子节点的大小
+	Name string // 子节点的名称
 }
 
 type Object struct {
+	Data  []string // 类型（blob、list、tree）
 	Links []Link
-	Data  []byte
 }
 
-func dfsForSliceFile(hight int, node File, store KVStore, seedId int, h hash.Hash) (*Object, int) {
-	// fmt.Println(hight)
-	// if hight < 1 {
-	// 	panic("invade!")
-	// }
-	if hight == 1 {
-		if (len(node.Bytes()) - seedId) <= 256*1024 {
-			data := node.Bytes()[seedId:]
-			blob := Object{
-				Links: nil,
-				Data:  data,
-			}
-			jsonMarshal, _ := json.Marshal(blob)
-			h.Reset()
-			h.Write(jsonMarshal)
-			flag, _ := store.Has(h.Sum(nil))
-			if !flag {
-				store.Put(h.Sum(nil), data)
-			}
-			return &blob, len(data)
-		}
-		links := &Object{}
-		lenData := 0
-		for i := 1; i <= 4096; i++ {
-			end := seedId + 256*1024
-			if len(node.Bytes()) < end {
-				end = len(node.Bytes())
-			}
-			data := node.Bytes()[seedId:end]
-			blob := Object{
-				Links: nil,
-				Data:  data,
-			}
-			lenData += len(data)
-			jsonMarshal, _ := json.Marshal(blob)
-			h.Reset()
-			h.Write(jsonMarshal)
-			flag, _ := store.Has(h.Sum(nil))
-			if !flag {
-				store.Put(h.Sum(nil), data)
-			}
-			links.Links = append(links.Links, Link{
-				Hash: h.Sum(nil),
-				Size: len(data),
-			})
-			links.Data = append(links.Data, []byte("blob")...)
-			seedId += 256 * 1024
-			if seedId >= len(node.Bytes()) {
-				break
-			}
-		}
-		jsonMarshal, _ := json.Marshal(links)
-		h.Reset()
-		h.Write(jsonMarshal)
-		flag, _ := store.Has(h.Sum(nil))
-		if !flag {
-			store.Put(h.Sum(nil), jsonMarshal)
-		}
-		return links, lenData
-	} else {
-		links := &Object{}
-		lenData := 0
-		for i := 1; i <= 4096; i++ {
-			if seedId >= len(node.Bytes()) {
-				break
-			}
-			tmp, lens := dfsForSliceFile(hight-1, node, store, seedId, h)
-			lenData += lens
-			jsonMarshal, _ := json.Marshal(tmp)
-			h.Reset()
-			h.Write(jsonMarshal)
-			links.Links = append(links.Links, Link{
-				Hash: h.Sum(nil),
-				// 对于link 它size是什么？
-				Size: lens,
-			})
-			typeName := "link"
-			if tmp.Links == nil {
-				typeName = "blob"
-			}
-			links.Data = append(links.Data, []byte(typeName)...)
-		}
-		jsonMarshal, _ := json.Marshal(links)
-		h.Reset()
-		h.Write(jsonMarshal)
-		flag, _ := store.Has(h.Sum(nil))
-		if !flag {
-			store.Put(h.Sum(nil), jsonMarshal)
-		}
-		return links, lenData
+// 序列化对象
+func serialize(obj *Object) ([]byte, error) {
+	var buf bytes.Buffer
+	err := gob.NewEncoder(&buf).Encode(obj)
+	if err != nil {
+		return nil, err
 	}
-}
-func sliceFile(node File, store KVStore, h hash.Hash) *Object {
-	// fmt.Println("222222")
-	if len(node.Bytes()) <= 256*1024 {
-		data := node.Bytes()
-		blob := Object{
-			Links: nil,
-			Data:  data,
-		}
-		jsonMarshal, _ := json.Marshal(blob)
-		h.Reset()
-		h.Write(jsonMarshal)
-		flag, _ := store.Has(h.Sum(nil))
-		if !flag {
-			store.Put(h.Sum(nil), data)
-		}
-		return &blob
-	}
-	linkLen := (len(node.Bytes()) + (256*1024 - 1)) / (256 * 1024)
-	hight := 0
-	tmp := linkLen
-	for {
-		hight++
-		tmp /= 4096
-		// fmt.Println(tmp)
-		if tmp == 0 {
-			break
-		}
-	}
-	// fmt.Println(hight)
-	res, _ := dfsForSliceFile(hight, node, store, 0, h)
-	return res
+	return buf.Bytes(), nil
 }
 
-func sliceDir(node Dir, store KVStore, h hash.Hash) *Object {
-	iter := node.It()
-	treeObject := &Object{}
-	for iter.Next() {
-		node := iter.Node()
-		if node.Type() == FILE {
-			file := node.(File)
-			tmp := sliceFile(file, store, h)
-			jsonMarshal, _ := json.Marshal(tmp)
-			h.Reset()
-			h.Write(jsonMarshal)
-			treeObject.Links = append(treeObject.Links, Link{
-				Hash: h.Sum(nil),
-				Size: int(file.Size()),
-				Name: file.Name(),
-			})
-			typeName := "link"
-			if tmp.Links == nil {
-				typeName = "blob"
-			}
-			treeObject.Data = append(treeObject.Data, []byte(typeName)...)
-		} else {
-			dir := node.(Dir)
-			tmp := sliceDir(dir, store, h)
-			jsonMarshal, _ := json.Marshal(tmp)
-			h.Reset()
-			h.Write(jsonMarshal)
-			treeObject.Links = append(treeObject.Links, Link{
-				Hash: h.Sum(nil),
-				Size: int(dir.Size()),
-				Name: dir.Name(),
-			})
-			typeName := "tree"
-			treeObject.Data = append(treeObject.Data, []byte(typeName)...)
-		}
-	}
-	jsonMarshal, _ := json.Marshal(treeObject)
+func storeBlob(store KVStore, data []byte, h hash.Hash, length int) ([]byte, string) {
 	h.Reset()
-	h.Write(jsonMarshal)
-	flag, _ := store.Has(h.Sum(nil))
-	if !flag {
-		store.Put(h.Sum(nil), jsonMarshal)
+	h.Write(data)
+	hashValue := h.Sum(nil)
+	obj := &Object{
+		Data: []string{"blob"},
+		//Links: links,
 	}
-	return treeObject
+
+	objBytes, _ := serialize(obj)
+	err := store.Put(hashValue, objBytes) // 存储序列化后的数据
+	if err != nil {
+		return nil, ""
+	}
+	return hashValue, "blob"
 }
-func Add(store KVStore, node Node, h hash.Hash) []byte {
-	// TODO 将分片写入到KVStore中，并返回Merkle Root
-	if node.Type() == FILE {
-		file := node.(File)
-		tmp := sliceFile(file, store, h)
-		jsonMarshal, _ := json.Marshal(tmp)
-		h.Write(jsonMarshal)
-		return h.Sum(nil)
+
+func storeBlobList(store KVStore, links []Link, h hash.Hash) ([]byte, string) {
+	data := make([]string, len(links))
+	for i := range data {
+		data[i] = "blob"
+	}
+
+	obj := &Object{
+		Data:  data,
+		Links: links,
+	}
+	objBytes, _ := serialize(obj)
+
+	h.Reset() // 重置哈希状态
+	h.Write(objBytes)
+	listHash := h.Sum(nil)
+
+	store.Put(listHash, objBytes) // 存储序列化后的数据
+	return listHash, "list"
+}
+
+// 将目录节点存储到数据库中
+func storeDir(store KVStore, node Node, h hash.Hash) []byte {
+	dir := node.(Dir)
+	childLinks := make([]Link, 0, dir.Size())
+	childData := make([]string, 0, dir.Size())
+
+	iterator := dir.It()
+
+	for iterator.Next() {
+		child := iterator.Node()
+		if child.Type() == FILE {
+			childHash, childType := storeFile(store, child, h)
+			link := Link{
+				Hash: string(childHash),
+				Size: int(child.Size()),
+				Name: child.Name(),
+			}
+			childLinks = append(childLinks, link)
+			childData = append(childData, childType)
+
+		} else if child.Type() == DIR {
+			dirHash := storeDir(store, child, h)
+			nodeType := "tree"
+			if len(childLinks) == 0 {
+				nodeType = "blob"
+			}
+			childLinks = append(childLinks, Link{string(dirHash), int(child.Size()), child.Name()})
+			childData = append(childData, nodeType)
+		}
+	}
+
+	obj := &Object{
+		Data:  childData,
+		Links: childLinks,
+	}
+
+	objBytes, err := serialize(obj)
+	if err != nil {
+		return nil
+	}
+	h.Reset()
+	h.Write(objBytes)
+	dirHash := h.Sum(nil)
+	store.Put(dirHash, objBytes)
+
+	return dirHash
+}
+func storeFile(store KVStore, node Node, h hash.Hash) ([]byte, string) {
+	file := node.(File)
+	fileContent := file.Bytes()
+
+	// 计算需要分割成的块数
+	numBlobs := int(math.Ceil(float64(len(fileContent)) / float64(Blob)))
+	if numBlobs == 1 {
+		blobData := make([]string, numBlobs)
+		blobData[0] = "blob"
+		h.Reset()
+		h.Write(file.Bytes()) //对文件内容进行hash
+		hashValue := h.Sum(nil)
+
+		obj := &Object{
+			Data: []string{"blob"},
+		}
+		objBytes, _ := serialize(obj)
+		err := store.Put(hashValue, objBytes) // 存储序列化后的数据
+		if err != nil {
+			return nil, ""
+		}
+		return hashValue, "blob"
+	}
+	blobLinks := make([]Link, numBlobs)
+	blobData := make([]string, numBlobs)
+	if numBlobs > 1 && numBlobs <= MaxBlobList {
+		// 当块数大于1且小于等于MaxBlobList时，将块存储到列表中
+		for i := 0; i < numBlobs; i++ {
+			start := i * Blob
+			end := int(math.Min(float64(start+Blob), float64(len(fileContent))))
+			blobChunk := fileContent[start:end]
+
+			blobHash, _ := storeBlob(store, blobChunk, h, end-start)
+
+			link := Link{
+				Hash: string(blobHash),
+				Size: end - start,
+				//Name: node.Name(),
+			}
+			blobLinks[i] = link
+			blobData[i] = "blob"
+		}
+
+		return storeBlobList(store, blobLinks, h)
 	} else {
-		dir := node.(Dir)
-		tmp := sliceDir(dir, store, h)
-		jsonMarshal, _ := json.Marshal(tmp)
-		h.Write(jsonMarshal)
-		return h.Sum(nil)
+		// 当块数大于MaxBlobList时，将块存储到多个列表中
+		numLists := int(math.Ceil(float64(numBlobs) / float64(MaxBlobList)))
+		listLinks := make([]Link, numLists)
+		listData := make([]string, numLists)
+
+		for i := 0; i < numLists; i++ {
+			start := i * MaxBlobList
+			end := int(math.Min(float64(start+MaxBlobList), float64(numBlobs)))
+			listLinksChunk := blobLinks[start:end]
+			listChunkSize := 0
+
+			for j := start; j < end; j++ {
+				listChunkSize += blobLinks[j].Size
+			}
+
+			listHash, _ := storeBlobList(store, listLinksChunk, h)
+
+			link := Link{
+				Hash: string(listHash),
+				Size: len(listLinksChunk),
+				//Name: node.Name(),
+			}
+			listLinks[i] = link
+			listData[i] = "list"
+		}
+
+		obj := &Object{
+			Data:  listData,
+			Links: listLinks,
+		}
+
+		objBytes, _ := serialize(obj)
+		h.Reset() // 重置哈希状态
+		h.Write(objBytes)
+		listHash := h.Sum(nil)
+		store.Put(listHash, objBytes)
+		return storeBlobList(store, listLinks, h)
+	}
+}
+
+// Add函数用于生成MerkleDAG
+func Add(store KVStore, node Node, h hash.Hash) []byte { //返回roothash和当前节点的类型
+	//TODO 将分片写入到KVStore中，并返回Merkle Root
+	var rootHash []byte
+	switch node.Type() {
+	case FILE:
+		rootHash, _ = storeFile(store, node, h)
+		return rootHash
+
+	case DIR:
+		rootHash = storeDir(store, node, h)
+		return rootHash
+	default:
+		return nil
+
 	}
 }
